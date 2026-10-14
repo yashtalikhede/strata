@@ -60,7 +60,7 @@ func (d *DB) flushLocked() error {
 		return err
 	}
 
-	reader, err := sstable.Open(sstPath)
+	reader, outSize, err := openTable(d.dir, sstNum)
 	if err != nil {
 		os.Remove(sstPath)
 		return fmt.Errorf("db: opening the table just written, %06d: %w", sstNum, err)
@@ -101,9 +101,10 @@ func (d *DB) flushLocked() error {
 
 	d.log, d.logNum = newLog, newLogNum
 	d.mem = memtable.New()
-	d.tables = append(d.tables, &table{num: sstNum, r: reader})
+	d.tables = append(d.tables, &table{num: sstNum, reader: reader, size: outSize})
 	d.nextFileNum = newLogNum + 1
 	d.flushes++
+	d.flushBytesWritten += uint64(outSize)
 	return nil
 }
 

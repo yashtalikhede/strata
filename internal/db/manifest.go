@@ -21,7 +21,14 @@ const manifestMagic uint64 = 0x7374726174616d
 
 // manifestVersion is the layout version written into every manifest. A reader
 // refuses a version it does not know rather than guessing at the layout.
-const manifestVersion uint32 = 1
+//
+// Version 2 differs from version 1 only in what it permits, not in its bytes:
+// table numbers no longer have to increase along the list, because a
+// compaction's output takes the position of its inputs while carrying a higher
+// number than the tables after it. A version 1 file is rejected outright
+// rather than migrated, which costs nothing because no data was ever deployed
+// under it.
+const manifestVersion uint32 = 2
 
 // Sizes of the manifest's fixed parts. The header is the magic, version,
 // nextFileNum, logNumber and table count; the trailer is the checksum.
@@ -40,7 +47,7 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // next file number comes from.
 //
 // It is small and rewritten whole, which is what lets a single atomic rename
-// serve as the commit point for a flush.
+// serve as the commit point for both a flush and a compaction.
 type manifest struct {
 	// nextFileNum is the lowest file number not yet handed out. Every file
 	// in the directory, log or table, draws its number from this one
@@ -52,6 +59,12 @@ type manifest struct {
 	logNumber uint64
 	// sstables lists the live tables, oldest first, which is also the order
 	// a read consults them in reverse.
+	//
+	// This order, and nothing else, decides which version of a key wins. In
+	// particular it is not the same as sorting by file number: a compaction
+	// writes its output with a fresh, high number but puts it where its
+	// inputs were, so a table late in the list can have a lower number than
+	// one before it.
 	sstables []uint64
 }
 
@@ -77,8 +90,11 @@ func (m manifest) encode() []byte {
 // exactly the bytes that follow. Only after the count has been pinned to the
 // input's own length is any memory allocated for it, so a corrupt count can
 // never turn into a huge allocation. The numbers are then checked for the
-// invariants the rest of the engine relies on: tables strictly increasing,
-// every number already handed out, and a log number that is not in the future.
+// invariants the rest of the engine relies on: tables all distinct, every
+// number already handed out, and a log number that is not in the future.
+//
+// Distinct rather than increasing: the list order carries the age of each
+// table, so the numbers along it need only name different files.
 func decodeManifest(b []byte) (manifest, error) {
 	if len(b) < manifestMinSize {
 		return manifest{}, fmt.Errorf("%w: manifest is %d bytes, shorter than the %d byte minimum", ErrCorrupt, len(b), manifestMinSize)
@@ -109,15 +125,18 @@ func decodeManifest(b []byte) (manifest, error) {
 	}
 
 	m.sstables = make([]uint64, 0, count)
+	// Bounded by count, which has already been pinned to the input length.
+	seen := make(map[uint64]int, count)
 	for i := range int(count) {
 		off := manifestHeaderSize + 8*i
 		n := binary.LittleEndian.Uint64(body[off : off+8])
-		if i > 0 && n <= m.sstables[i-1] {
-			return manifest{}, fmt.Errorf("%w: manifest table %d has number %d, not above the previous %d", ErrCorrupt, i, n, m.sstables[i-1])
+		if first, dup := seen[n]; dup {
+			return manifest{}, fmt.Errorf("%w: manifest lists table %d at positions %d and %d", ErrCorrupt, n, first, i)
 		}
 		if n >= m.nextFileNum {
 			return manifest{}, fmt.Errorf("%w: manifest table %d has number %d, which was never handed out (next is %d)", ErrCorrupt, i, n, m.nextFileNum)
 		}
+		seen[n] = i
 		m.sstables = append(m.sstables, n)
 	}
 	if m.logNumber > m.nextFileNum {

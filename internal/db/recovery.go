@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/yashtalikhede/strata/internal/sstable"
 	"github.com/yashtalikhede/strata/internal/wal"
 )
 
@@ -231,11 +230,11 @@ func (d *DB) removeLogsBelow(wals []uint64, logNumber uint64) error {
 // data, so carrying on without it would serve stale or missing answers.
 func (d *DB) openTables(m manifest) error {
 	for _, num := range m.sstables {
-		r, err := sstable.Open(filepath.Join(d.dir, sstName(num)))
+		reader, size, err := openTable(d.dir, num)
 		if err != nil {
 			return fmt.Errorf("%w: opening table %06d: %w", ErrCorrupt, num, err)
 		}
-		d.tables = append(d.tables, &table{num: num, r: r})
+		d.tables = append(d.tables, &table{num: num, reader: reader, size: size})
 	}
 	return nil
 }

@@ -190,7 +190,15 @@ func TestPersistenceViaWAL(t *testing.T) {
 
 func TestFlushAndReadAcrossSSTables(t *testing.T) {
 	dir := t.TempDir()
-	d := openDB(t, dir, &Options{MemtableSize: 4 << 10, Sync: wal.SyncNone})
+	// Compaction is off here on purpose: this test is about reading across
+	// many tables, and the table count is how it checks that it is actually
+	// doing so. With compaction on there is no way to keep ten tables around,
+	// and the merged read path gets its own tests.
+	d := openDB(t, dir, &Options{
+		MemtableSize:          4 << 10,
+		Sync:                  wal.SyncNone,
+		DisableAutoCompaction: true,
+	})
 
 	// Values big enough that a 4 KiB memtable fills every few writes.
 	const n = 600
@@ -257,126 +265,201 @@ func TestTombstoneShadowsOlderSSTable(t *testing.T) {
 }
 
 func TestNewestWins(t *testing.T) {
-	dir := t.TempDir()
-	d := openDB(t, dir, &Options{Sync: wal.SyncNone})
 	k := []byte("contested")
 
-	for round := range 5 {
-		if err := d.Put(k, []byte(fmt.Sprintf("round-%d", round))); err != nil {
-			t.Fatalf("Put: %v", err)
-		}
-		if err := d.Flush(); err != nil {
-			t.Fatalf("Flush: %v", err)
-		}
-		expectValue(t, d, k, []byte(fmt.Sprintf("round-%d", round)))
-	}
-	if got := d.Stats().SSTables; got != 5 {
-		t.Fatalf("SSTables = %d, want 5", got)
-	}
-	expectValue(t, d, k, []byte("round-4"))
+	// Compaction off, so the five versions really do sit in five tables and
+	// the lookup has to pick between them.
+	t.Run("across tables", func(t *testing.T) {
+		dir := t.TempDir()
+		opts := &Options{Sync: wal.SyncNone, DisableAutoCompaction: true}
+		d := openDB(t, dir, opts)
 
-	if err := d.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	d2 := openDB(t, dir, &Options{Sync: wal.SyncNone})
-	expectValue(t, d2, k, []byte("round-4"))
+		for round := range 5 {
+			if err := d.Put(k, []byte(fmt.Sprintf("round-%d", round))); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			if err := d.Flush(); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			expectValue(t, d, k, []byte(fmt.Sprintf("round-%d", round)))
+		}
+		if got := d.Stats().SSTables; got != 5 {
+			t.Fatalf("SSTables = %d, want 5", got)
+		}
+		expectValue(t, d, k, []byte("round-4"))
+
+		if err := d.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		d2 := openDB(t, dir, opts)
+		expectValue(t, d2, k, []byte("round-4"))
+	})
+
+	// And the answer must survive the five tables being merged into one,
+	// which is the same property asked of the compactor instead of the
+	// lookup.
+	t.Run("after compaction", func(t *testing.T) {
+		dir := t.TempDir()
+		opts := &Options{Sync: wal.SyncNone, DisableAutoCompaction: true}
+		d := openDB(t, dir, opts)
+
+		for round := range 5 {
+			if err := d.Put(k, []byte(fmt.Sprintf("round-%d", round))); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			if err := d.Flush(); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+		}
+		if err := d.Compact(); err != nil {
+			t.Fatalf("Compact: %v", err)
+		}
+		if got := d.Stats().SSTables; got != 1 {
+			t.Fatalf("SSTables after Compact = %d, want 1", got)
+		}
+		if got := d.Stats().ShadowedDropped; got != 4 {
+			t.Errorf("ShadowedDropped = %d, want 4 older versions discarded", got)
+		}
+		expectValue(t, d, k, []byte("round-4"))
+
+		if err := d.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		d2 := openDB(t, dir, opts)
+		expectValue(t, d2, k, []byte("round-4"))
+	})
 }
 
 func TestModelRandomized(t *testing.T) {
-	for _, seed := range []uint64{3, 11} {
-		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
-			// The two seeds work in separate directories, so they are
-			// independent. They are also slow, for a reason worth naming:
-			// with no compaction the run ends with well over a thousand
-			// tables, and each of its ~600 reopens has to open every one of
-			// them. Running them side by side keeps the suite tolerable.
-			t.Parallel()
-			const (
-				ops      = 30_000
-				keyspace = 400
-			)
-			rng := rand.New(rand.NewPCG(seed, seed))
-			dir := t.TempDir()
-			opts := &Options{MemtableSize: 8 << 10, Sync: wal.SyncNone}
+	variants := []struct {
+		name string
+		opts Options
+	}{
+		{
+			// Small sizes so flushes and compactions both happen often.
+			name: "compaction on",
+			opts: Options{MemtableSize: 8 << 10, CompactionBaseSize: 32 << 10, Sync: wal.SyncNone},
+		},
+		{
+			name: "compaction off",
+			opts: Options{MemtableSize: 8 << 10, Sync: wal.SyncNone, DisableAutoCompaction: true},
+		},
+	}
 
-			d, err := Open(dir, opts)
-			if err != nil {
-				t.Fatalf("Open: %v", err)
-			}
-			defer func() {
-				if d != nil {
-					d.Close()
+	for _, variant := range variants {
+		for _, seed := range []uint64{3, 11} {
+			t.Run(fmt.Sprintf("%s/seed-%d", strings.ReplaceAll(variant.name, " ", "-"), seed), func(t *testing.T) {
+				t.Parallel()
+				const (
+					ops      = 30_000
+					keyspace = 400
+				)
+				rng := rand.New(rand.NewPCG(seed, seed))
+				dir := t.TempDir()
+				opts := variant.opts
+
+				d, err := Open(dir, &opts)
+				if err != nil {
+					t.Fatalf("Open: %v", err)
 				}
-			}()
-
-			// model holds the value for each live key; absence means either
-			// never written or deleted, which Get reports the same way.
-			model := make(map[string][]byte, keyspace)
-			poolKey := func(i int) string { return fmt.Sprintf("key-%04d", i) }
-
-			reopens, flushes := 0, 0
-			for range ops {
-				k := poolKey(rng.IntN(keyspace))
-				switch roll := rng.IntN(100); {
-				case roll < 50: // Put
-					v := []byte(fmt.Sprintf("v-%d-%s", rng.Uint64(), strings.Repeat("x", rng.IntN(80))))
-					if err := d.Put([]byte(k), v); err != nil {
-						t.Fatalf("Put(%s): %v", k, err)
+				defer func() {
+					if d != nil {
+						d.Close()
 					}
-					model[k] = v
-				case roll < 70: // Delete
-					if err := d.Delete([]byte(k)); err != nil {
-						t.Fatalf("Delete(%s): %v", k, err)
+				}()
+
+				// model holds the value for each live key; absence means
+				// either never written or deleted, which Get reports the
+				// same way.
+				model := make(map[string][]byte, keyspace)
+				poolKey := func(i int) string { return fmt.Sprintf("key-%04d", i) }
+
+				// Counters reset when a database is closed, and this
+				// workload reopens hundreds of times, so the totals have to
+				// be gathered before each Close rather than read at the end.
+				var reopens, flushes, compacts int
+				var totalCompactions, totalCompactionErrors uint64
+				for range ops {
+					k := poolKey(rng.IntN(keyspace))
+					switch roll := rng.IntN(100); {
+					case roll < 50: // Put
+						v := []byte(fmt.Sprintf("v-%d-%s", rng.Uint64(), strings.Repeat("x", rng.IntN(80))))
+						if err := d.Put([]byte(k), v); err != nil {
+							t.Fatalf("Put(%s): %v", k, err)
+						}
+						model[k] = v
+					case roll < 70: // Delete
+						if err := d.Delete([]byte(k)); err != nil {
+							t.Fatalf("Delete(%s): %v", k, err)
+						}
+						delete(model, k)
+					case roll < 94: // Get
+						got, err := d.Get([]byte(k))
+						want, live := model[k]
+						switch {
+						case !live:
+							if !errors.Is(err, ErrNotFound) {
+								t.Fatalf("Get(%s) = (%q, %v), want ErrNotFound", k, got, err)
+							}
+						case err != nil:
+							t.Fatalf("Get(%s) = %v, want %q", k, err, want)
+						case !bytes.Equal(got, want):
+							t.Fatalf("Get(%s) = %q, want %q", k, got, want)
+						}
+					case roll < 97: // Flush
+						if err := d.Flush(); err != nil {
+							t.Fatalf("Flush: %v", err)
+						}
+						flushes++
+					case roll < 98: // Compact
+						if err := d.Compact(); err != nil {
+							t.Fatalf("Compact: %v", err)
+						}
+						compacts++
+					default: // Close and reopen
+						s := d.Stats()
+						totalCompactions += s.Compactions
+						totalCompactionErrors += s.CompactionErrors
+						if err := d.Close(); err != nil {
+							t.Fatalf("Close: %v", err)
+						}
+						if d, err = Open(dir, &opts); err != nil {
+							t.Fatalf("reopen: %v", err)
+						}
+						reopens++
 					}
-					delete(model, k)
-				case roll < 95: // Get
+				}
+
+				// Every key in the pool, live or not.
+				for i := range keyspace {
+					k := poolKey(i)
 					got, err := d.Get([]byte(k))
 					want, live := model[k]
 					switch {
 					case !live:
 						if !errors.Is(err, ErrNotFound) {
-							t.Fatalf("Get(%s) = (%q, %v), want ErrNotFound", k, got, err)
+							t.Fatalf("final Get(%s) = (%q, %v), want ErrNotFound", k, got, err)
 						}
 					case err != nil:
-						t.Fatalf("Get(%s) = %v, want %q", k, err, want)
+						t.Fatalf("final Get(%s) = %v, want %q", k, err, want)
 					case !bytes.Equal(got, want):
-						t.Fatalf("Get(%s) = %q, want %q", k, got, want)
+						t.Fatalf("final Get(%s) = %q, want %q", k, got, want)
 					}
-				case roll < 98: // Flush
-					if err := d.Flush(); err != nil {
-						t.Fatalf("Flush: %v", err)
-					}
-					flushes++
-				default: // Close and reopen
-					if err := d.Close(); err != nil {
-						t.Fatalf("Close: %v", err)
-					}
-					if d, err = Open(dir, opts); err != nil {
-						t.Fatalf("reopen: %v", err)
-					}
-					reopens++
 				}
-			}
 
-			// Every key in the pool, live or not.
-			for i := range keyspace {
-				k := poolKey(i)
-				got, err := d.Get([]byte(k))
-				want, live := model[k]
-				switch {
-				case !live:
-					if !errors.Is(err, ErrNotFound) {
-						t.Fatalf("final Get(%s) = (%q, %v), want ErrNotFound", k, got, err)
-					}
-				case err != nil:
-					t.Fatalf("final Get(%s) = %v, want %q", k, err, want)
-				case !bytes.Equal(got, want):
-					t.Fatalf("final Get(%s) = %q, want %q", k, got, want)
+				stats := d.Stats()
+				totalCompactions += stats.Compactions
+				totalCompactionErrors += stats.CompactionErrors
+				if totalCompactionErrors != 0 {
+					t.Errorf("CompactionErrors = %d (last: %v)", totalCompactionErrors, d.LastCompactionError())
 				}
-			}
-			t.Logf("%d ops, %d live keys, %d explicit flushes, %d reopens, %d tables",
-				ops, len(model), flushes, reopens, d.Stats().SSTables)
-		})
+				if totalCompactions == 0 {
+					t.Error("no compaction ran at all; the workload did not provoke any")
+				}
+				t.Logf("%d ops, %d live keys, %d flushes, %d explicit compacts, %d reopens, %d tables, %d compactions in all, write-amp %.2f since the last open",
+					ops, len(model), flushes, compacts, reopens, stats.SSTables, totalCompactions, stats.WriteAmplification())
+			})
+		}
 	}
 }
 
@@ -942,15 +1025,22 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 
-	d, err := Open(dir, &Options{MemtableSize: 4 << 10, Sync: wal.SyncAlways})
+	d, err := Open(dir, &Options{
+		MemtableSize:       4 << 10,
+		CompactionBaseSize: 32 << 10,
+		Sync:               wal.SyncAlways,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "helper: Open: %v\n", err)
 		os.Exit(2)
 	}
 
-	// Write until killed, reporting each acknowledged operation. os.Stdout is
-	// unbuffered, so a sequence number reaching the parent means the Put or
-	// Delete, and the fsync inside it, had already returned.
+	// Write until killed, reporting each acknowledged operation together with
+	// the number of compactions done so far. os.Stdout is unbuffered, so a
+	// line reaching the parent means the Put or Delete, and the fsync inside
+	// it, had already returned; the compaction count on that line is one the
+	// child really reached before it was killed, which is how the parent
+	// knows compaction was active in the process it killed.
 	for seq := from; ; seq++ {
 		if err := d.Put(helperKey(seq), helperValue(seq)); err != nil {
 			fmt.Fprintf(os.Stderr, "helper: Put(%d): %v\n", seq, err)
@@ -964,7 +1054,7 @@ func TestHelperProcess(t *testing.T) {
 				os.Exit(2)
 			}
 		}
-		fmt.Fprintln(os.Stdout, seq)
+		fmt.Fprintf(os.Stdout, "%d %d\n", seq, d.Stats().Compactions)
 	}
 }
 
@@ -981,15 +1071,25 @@ func TestCrashRecoveryProcessKill(t *testing.T) {
 	// killed at a different point, so the crash lands at a different place in
 	// the flush cycle each time.
 	targets := []int{300, 450, 777, 1000}
+	opts := &Options{
+		MemtableSize:       4 << 10,
+		CompactionBaseSize: 32 << 10,
+		Sync:               wal.SyncAlways,
+	}
 	next := 0
+	var childCompactions uint64
 
 	for round, target := range targets {
 		acked := runHelperUntilKilled(t, dir, next, target)
 		if len(acked) < target {
 			t.Fatalf("round %d: saw %d acknowledgements, want at least %d", round, len(acked), target)
 		}
+		// The highest count the child reported on a line the parent actually
+		// read, so it was reached before the kill.
+		roundCompactions := acked[len(acked)-1].compactions
+		childCompactions += roundCompactions
 
-		d, err := Open(dir, &Options{MemtableSize: 4 << 10, Sync: wal.SyncAlways})
+		d, err := Open(dir, opts)
 		if err != nil {
 			t.Fatalf("round %d: Open after kill: %v", round, err)
 		}
@@ -998,27 +1098,27 @@ func TestCrashRecoveryProcessKill(t *testing.T) {
 		// deleted if some acknowledged seq deleted it and no later
 		// acknowledged seq rewrote it; here each key is written once and
 		// possibly deleted once, seven operations later.
-		highest := acked[len(acked)-1]
+		highest := acked[len(acked)-1].seq
 		deleted := make(map[int]bool)
-		for _, seq := range acked {
-			if seq%7 == 0 && seq-7 >= 0 {
-				deleted[seq-7] = true
+		for _, a := range acked {
+			if a.seq%7 == 0 && a.seq-7 >= 0 {
+				deleted[a.seq-7] = true
 			}
 		}
-		for _, seq := range acked {
-			got, err := d.Get(helperKey(seq))
-			if deleted[seq] {
+		for _, a := range acked {
+			got, err := d.Get(helperKey(a.seq))
+			if deleted[a.seq] {
 				if !errors.Is(err, ErrNotFound) {
 					t.Fatalf("round %d: Get(seq %d) = (%q, %v), want ErrNotFound after its delete was acknowledged",
-						round, seq, got, err)
+						round, a.seq, got, err)
 				}
 				continue
 			}
 			if err != nil {
-				t.Fatalf("round %d: Get(seq %d) = %v, want %q", round, seq, err, helperValue(seq))
+				t.Fatalf("round %d: Get(seq %d) = %v, want %q", round, a.seq, err, helperValue(a.seq))
 			}
-			if !bytes.Equal(got, helperValue(seq)) {
-				t.Fatalf("round %d: Get(seq %d) = %q, want %q", round, seq, got, helperValue(seq))
+			if !bytes.Equal(got, helperValue(a.seq)) {
+				t.Fatalf("round %d: Get(seq %d) = %q, want %q", round, a.seq, got, helperValue(a.seq))
 			}
 		}
 		// Nothing beyond what the child could have written.
@@ -1035,16 +1135,24 @@ func TestCrashRecoveryProcessKill(t *testing.T) {
 		if n := countSuffix(t, dir, walSuffix); n != 1 {
 			t.Errorf("round %d: %d logs on disk after recovery, want exactly 1", round, n)
 		}
-		t.Logf("round %d: killed after %d acks (seq %d..%d), recovered into %d tables",
-			round, len(acked), acked[0], highest, stats.SSTables)
+		expectCleanDirectory(t, dir)
+		t.Logf("round %d: killed after %d acks (seq %d..%d), child had completed %d compactions, recovered into %d tables",
+			round, len(acked), acked[0].seq, highest, roundCompactions, stats.SSTables)
 		next = highest + 1
+	}
+
+	// The point of wiring compaction into this test is that the crashes land
+	// in a process that is compacting, so a run where none happened would
+	// prove much less.
+	if childCompactions == 0 {
+		t.Error("no round's child reported a completed compaction; the crashes did not exercise compaction")
 	}
 }
 
 // runHelperUntilKilled starts the helper on dir beginning at sequence from,
 // waits for at least target acknowledgements, SIGKILLs it, and returns the
-// sequence numbers it saw acknowledged.
-func runHelperUntilKilled(t *testing.T, dir string, from, target int) []int {
+// acknowledgements it saw.
+func runHelperUntilKilled(t *testing.T, dir string, from, target int) []ack {
 	t.Helper()
 
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
@@ -1063,32 +1171,40 @@ func runHelperUntilKilled(t *testing.T, dir string, from, target int) []int {
 		t.Fatalf("Start helper: %v", err)
 	}
 
-	acks := make(chan int, 1<<16)
+	acks := make(chan ack, 1<<16)
 	go func() {
 		defer close(acks)
 		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
-			n, err := strconv.Atoi(strings.TrimSpace(sc.Text()))
-			if err != nil {
+			fields := strings.Fields(sc.Text())
+			if len(fields) != 2 {
 				continue // Test-framework chatter, not an acknowledgement.
 			}
-			acks <- n
+			seq, err := strconv.Atoi(fields[0])
+			if err != nil {
+				continue
+			}
+			compactions, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				continue
+			}
+			acks <- ack{seq: seq, compactions: compactions}
 		}
 	}()
 
 	// fsync is slow, especially F_FULLFSYNC on macOS, so allow plenty of
 	// time for the first target operations.
 	deadline := time.After(5 * time.Minute)
-	var seen []int
+	var seen []ack
 	for len(seen) < target {
 		select {
-		case n, ok := <-acks:
+		case a, ok := <-acks:
 			if !ok {
 				_ = cmd.Wait()
 				t.Fatalf("helper exited after %d acknowledgements, want at least %d; stderr: %s",
 					len(seen), target, stderr.String())
 			}
-			seen = append(seen, n)
+			seen = append(seen, a)
 		case <-deadline:
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
@@ -1102,12 +1218,19 @@ func runHelperUntilKilled(t *testing.T, dir string, from, target int) []int {
 	}
 	_ = cmd.Wait() // SIGKILL always reports an error; nothing to learn from it.
 
-	for i, n := range seen {
-		if want := from + i; n != want {
-			t.Fatalf("acknowledgement %d reported sequence %d, want %d; the helper is not counting up", i, n, want)
+	for i, a := range seen {
+		if want := from + i; a.seq != want {
+			t.Fatalf("acknowledgement %d reported sequence %d, want %d; the helper is not counting up", i, a.seq, want)
 		}
 	}
 	return seen
+}
+
+// ack is one acknowledged operation as the child reported it, with the number
+// of compactions the child had completed by that point.
+type ack struct {
+	seq         int
+	compactions uint64
 }
 
 func BenchmarkPutSyncNone(b *testing.B) {
@@ -1196,24 +1319,4 @@ func BenchmarkGetSSTables(b *testing.B) {
 	}
 	after := d.Stats()
 	b.ReportMetric(float64(after.BlockReads-before.BlockReads)/float64(b.N), "blockreads/op")
-}
-
-func BenchmarkGetMissing(b *testing.B) {
-	const n = 100_000
-	d := preloadTables(b, n)
-
-	b.ReportAllocs()
-	before := d.Stats()
-	i := 0
-	for b.Loop() {
-		// Keys of the same shape but outside the written range.
-		_, err := d.Get([]byte(fmt.Sprintf("%016d", n+(i%1024))))
-		if !errors.Is(err, ErrNotFound) {
-			b.Fatalf("Get(absent) = %v, want ErrNotFound", err)
-		}
-		i++
-	}
-	after := d.Stats()
-	b.ReportMetric(float64(after.BlockReads-before.BlockReads)/float64(b.N), "blockreads/op")
-	b.ReportMetric(float64(after.BloomRejects-before.BloomRejects)/float64(b.N), "bloomrejects/op")
 }
