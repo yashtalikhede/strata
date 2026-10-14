@@ -100,9 +100,71 @@ Appends serialise on a mutex held across the write, so two writers can never
 interleave halves of their records, and the encoding buffer is reused between
 appends, which leaves a steady stream of writes free of allocations.
 
+### A write end to end
+
+Put and Delete are the same operation with a different record type, and both
+run the same three steps under the database's write lock.
+
+First the record goes to the log. Until that append returns there is nothing to
+recover, and if it fails the memtable must look exactly as it did before, so
+the memtable is not touched until the log has accepted the record. A log error
+is returned wrapped, with its own sentinel intact, so a caller can tell
+`wal.ErrRecordTooLarge` from a full disk; in either case the key is absent
+afterwards and the database is still usable.
+
+Then the record is applied to the memtable, a Put storing the value and a
+Delete storing a tombstone. Both copy their arguments, so the caller's slices
+are its own afterwards. At this point the write is done as far as the caller is
+concerned: it is durable to whatever degree the sync policy promises, and the
+next Get will see it.
+
+Last, the write checks whether it has made the memtable too big. If
+`ApproxSize` has reached `MemtableSize`, the same call that did the write also
+performs the flush, synchronously, still holding the write lock. That is what
+makes a flush failure awkward to report, and why Put returns an error wrapping
+`ErrFlushFailed` rather than a plain failure: the write itself succeeded and is
+visible, and only the move to a table did not happen. Retrying the write would
+duplicate it; the thing to look at is why the disk refused. The memtable stays
+where it is and the next write will try to flush it again.
+
+The whole sequence holds one write lock, so writes are serialised against each
+other and against flushes, while reads share a read lock and run in parallel
+with each other. A flush therefore stalls every writer for as long as it takes
+to write a table and commit a manifest. See the limitations section.
+
 ## Read path
 
-To be written in phase 4
+A Get asks each source in turn, newest first, and the first source that holds
+any record for the key decides the answer. The memtable comes first, then the
+tables from newest to oldest.
+
+The word "any" is the whole of it. A source that holds a tombstone for the key
+answers just as conclusively as one that holds a value: the lookup stops and
+reports the key as absent. That is what makes a delete work in a structure that
+never edits anything in place. The older value is still sitting in an older
+table, untouched, and the only reason it does not surface is that the search
+reached the newer tombstone first and stopped. The same mechanism makes an
+overwrite work, since a newer value shadows an older one for exactly the same
+reason.
+
+Each table's own lookup is described under file formats: its Bloom filter turns
+most absent keys away without any I/O, and otherwise its index names the single
+block that could hold the key. So a Get that misses pays one Bloom check per
+table and usually no disk read at all, while a Get that hits pays one block read
+in the table that has it, plus a Bloom check in each newer table it looked
+through first. The cost of a miss therefore grows with the number of tables,
+which is the read amplification that compaction exists to bound and that this
+phase does nothing about.
+
+A table that cannot be read stops the Get and returns the error. Skipping a
+corrupt table and carrying on to an older one would be worse than failing: the
+older table may hold a stale value for the key, and serving it would turn
+detected corruption into a silently wrong answer.
+
+Reads hold only a read lock, so any number of them proceed together. They do
+not see a consistent snapshot across sources, because nothing stops a flush
+from running between one Get and the next; what they do see is one atomic
+result per call, since a flush cannot run during a Get.
 
 ## File formats
 
@@ -295,6 +357,145 @@ No support for tables that outgrow a uint32 block length, which is a limit on
 one entry rather than on the table, and no checksum over the data section as a
 whole, so a block that is never read is never verified.
 
+## Directory layout and the MANIFEST
+
+A database is one directory:
+
+    <dir>/LOCK          the process lock
+    <dir>/MANIFEST      the authoritative list of live tables and logs
+    <dir>/NNNNNN.wal    write-ahead logs
+    <dir>/NNNNNN.sst    sorted tables
+
+Every file draws its number from one counter, so a number is never reused for a
+file of the other kind and the name alone identifies a file for the life of the
+database. Six zero-padded digits make a directory listing sort the same way
+lexically as numerically.
+
+The manifest is what makes the directory mean something. The files on disk are
+only candidates; the manifest says which of them are live, and anything it does
+not account for is debris to be deleted. Its layout, little endian throughout,
+is
+
+    [magic uint64][version uint32][nextFileNum uint64][logNumber uint64]
+    [count uint32][count x table number uint64, oldest to newest]
+    [crc32c uint32 over everything above]
+
+`nextFileNum` is the lowest number not yet handed out. `logNumber` is the first
+log that still matters: logs numbered at or above it hold records that are not
+yet in any table and must be replayed, and logs below it have been superseded
+and are deleted. The table numbers are listed oldest to newest, which is the
+order a read walks in reverse.
+
+It is read as suspiciously as any other file. The length is checked, then the
+checksum, because no field means anything if the bytes are damaged, then the
+magic and version, then the table count, which must account for exactly the
+bytes between the header and the checksum. Only after the count has been pinned
+to the input's own length is memory allocated for it, so a corrupt count cannot
+become a huge allocation. Then the numbers themselves: tables strictly
+increasing, every number below `nextFileNum`, and a log number not in the
+future. A manifest that fails any of these gives an error wrapping
+`ErrCorrupt`, and since the manifest is the only thing that says what is live,
+that failure stops the open rather than being worked around.
+
+Writing it is the same temporary-file dance the tables use: write
+`MANIFEST.tmp`, fsync it, rename it over `MANIFEST`, fsync the directory. The
+rename is atomic, so a reader sees the old manifest or the new one and never
+half of either, and the directory fsync is what makes the rename durable, since
+a rename changes the directory rather than the file.
+
+## Flush
+
+A flush turns the memtable into a table. Its steps are ordered so that exactly
+one of them commits, and everything before that point can be discarded without
+consequence.
+
+1. Snapshot the memtable with `Entries`. An empty snapshot means there is
+   nothing to do, and an empty flush is a no-op rather than an empty table.
+2. Write the table and open a reader on it. No manifest references the file
+   yet, so as far as any future open is concerned it does not exist.
+3. Create the log that writes will go to next. Also unreferenced, and still
+   empty, because nothing is pointed at it until step 5.
+4. Write a manifest naming the new table and the new log. **This is the commit
+   point.** Before this rename the old state is whole and the two new files are
+   orphans; after it the new state is whole and the old log is the orphan.
+   There is no moment in between, because the rename is atomic.
+5. Only now change anything in memory: close and delete the old log, install
+   the new one, start a fresh memtable, and add the reader to the live list.
+6. Count the flush.
+
+A failure anywhere before step 4 leaves the in-memory state exactly as it was
+and removes the files this flush created, as a courtesy rather than a
+requirement: the next open would delete them anyway for not being in the
+manifest. A failure to delete the old log in step 5 is ignored outright,
+because the manifest has already moved past it and the next open will sweep it
+up. That asymmetry is the point of having a single commit point: before it,
+nothing needs to be undone; after it, nothing is allowed to fail.
+
+## Recovery
+
+Opening a database runs the following, in an order forced by what each step
+needs from the one before it.
+
+1. Create the directory if needed, then take the process lock. Nothing else is
+   touched until the lock is held, because everything after this assumes no
+   other process is doing the same thing.
+2. Read the manifest. A directory with no manifest but with tables or logs in
+   it is not a new database, it is one whose manifest was lost, and there is no
+   way to know which tables were live or which logs still mattered; starting
+   empty would silently discard all of it, so that is `ErrCorrupt` instead. A
+   genuinely empty directory gets an initial manifest written before anything
+   else happens.
+3. Delete what the manifest does not account for: temporary files from an
+   interrupted write, tables no manifest lists, and logs below the log number.
+   Each is crash debris, and each is safe to delete precisely because the
+   manifest does not point at it.
+4. Open a reader for every table the manifest lists. A missing or unreadable
+   one fails the open, since the manifest says it holds live data.
+5. Replay every live log, oldest first, into a fresh memtable, so that later
+   records overwrite earlier ones exactly as they did before the crash.
+6. Set the next file number above both what the manifest promised and anything
+   on disk, so a new file can never be given a name that already exists.
+7. If the replayed memtable has anything in it, flush it. Otherwise create a
+   fresh log and commit a manifest naming it.
+
+Step 7 is the one worth dwelling on. A replayed memtable is already durable, in
+the logs it was replayed from, so keeping it in memory and carrying on would be
+correct. The reason to flush it instead is that it would otherwise be replayed
+again on the next open, and the open after that, with the log growing each time
+a process died before filling it; a database that crashes repeatedly would
+spend ever longer starting up. Flushing turns those records into a table once,
+which lets the logs be deleted, so every open starts from exactly one live and
+empty log no matter what happened before it. That invariant is also what makes
+the crash cases tractable to reason about: there is only ever one log being
+appended to, and the only way to have several is a crash partway through a
+flush, which the next open resolves.
+
+Close is deliberately not a flush. The memtable's contents are in the log, and
+recovery replays the log, so flushing on close would only do early the work
+that the next open does anyway. Close syncs and closes the log, closes the
+readers, and releases the lock.
+
+## The directory lock
+
+`LOCK` is held with `flock` for as long as the database is open, and a second
+open of the same directory returns `ErrLocked`. The lock exists because
+recovery rewrites the directory: two processes recovering at once would both
+decide which files are debris, both delete them, and both write a manifest over
+the other's.
+
+`flock` is attached to the open file descriptor rather than to the path, which
+gives the property that matters here: it is released by the kernel when the
+process goes away, however it goes away. There is no stale lock to break after
+a crash, which is exactly what a lock guarding crash recovery needs. The `LOCK`
+file itself is never deleted, because removing it would let another process
+create and lock a fresh one while this process still believed it held the
+directory.
+
+The lock is unix-only. On other platforms acquiring it succeeds
+unconditionally and nothing prevents two processes from opening the same
+database at once, which would let both recover and both write; a caller there
+has to arrange exclusion itself.
+
 ## Compaction
 
 To be written in phase 5
@@ -365,6 +566,52 @@ could in principle be missing after a power loss moments later. That gap is
 harmless as things stand, because a log that does not exist replays as an empty
 log and an empty database is what the caller started with. It would need
 closing if the log file ever came to carry information merely by existing.
+
+## Known limitations at the end of Phase 4
+
+The engine works and does not lose acknowledged data, but it is not finished,
+and the gaps are structural rather than cosmetic.
+
+Flushes are synchronous and hold the write lock. A writer that trips the
+memtable limit writes the whole table and commits the manifest before it
+returns, and every other writer waits behind it. Write latency is therefore
+smooth until it is not: most writes cost a log append, and one in however many
+costs a table write and three fsyncs. Moving the flush to a background
+goroutine, with a second memtable taking writes while the first is written out,
+is the fix, and it is the main reason the mutex is a single one rather than
+something finer.
+
+There is no compaction, and this is the largest gap. Tables accumulate, one per
+flush, and nothing ever merges or removes them. Three things follow. A Get that
+misses has to consult every table, so read cost grows with the number of
+flushes rather than with the amount of data; the Bloom filters keep that to one
+check per table instead of a disk read, but the checks still add up. An
+overwritten value stays on disk forever, in the older table nobody reads it
+from. And a tombstone can never be discarded, because there is always the
+possibility of an older table holding the value it shadows, so deleting data
+only ever adds to the space used. The randomised test in this phase ends with
+well over a thousand tables for a few hundred live keys, which is the shape of
+the problem rather than a realistic workload, and reopening such a database
+means opening every one of those tables. Phase 5 exists for this.
+
+There are no range scans, iterators or snapshots in the public API. A caller
+can look one key up and nothing else. The sorted tables and the memtable both
+support ordered traversal already, so the missing piece is a merging iterator
+over all the sources with the same newest-wins and tombstone rules the point
+lookup uses; that is also what compaction will need internally.
+
+A log corrupted in the middle loses everything after the corruption. This is
+inherited from the log format described under the write path: the format has no
+resynchronisation marker, so a replay that loses its place cannot find the next
+record, and recovery truncates from there. For a database it means a damaged
+log costs not just the damaged record but every acknowledged write that
+followed it.
+
+The process lock is unix-only, as described above.
+
+There is no block cache. Every block a lookup reads is read from the operating
+system and allocated fresh, so a hot block is re-read and re-allocated on every
+Get that touches it. The page cache absorbs the I/O, but not the allocation.
 
 ## Benchmarks
 
