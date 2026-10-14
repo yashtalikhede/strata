@@ -106,7 +106,194 @@ To be written in phase 4
 
 ## File formats
 
-To be written in phase 3
+The write-ahead log's record format is described under the write path above.
+This section covers the sorted table, which is the engine's one durable store
+of data, and the Bloom filter that fronts it.
+
+### SSTable
+
+A table is immutable once written. Nothing edits one in place, which is what
+lets a reader hold its index in memory and trust it, and what lets compaction
+treat a table as a value rather than something to lock.
+
+The file is laid out in four parts, little endian throughout:
+
+    [data block 0][data block 1] ... [data block N-1]
+    [index block]
+    [bloom block]
+    [footer]
+
+A data block is entries written back to back and then a four-byte CRC-32C of
+those entry bytes. An entry is
+
+    [flags byte][keyLen uvarint][valLen uvarint][key][value]
+
+with bit 0 of flags marking a tombstone. A tombstone stores a value length of
+zero and no value bytes, and so does a put of an empty value; the flags byte is
+what tells them apart, which is why a reader rejects an entry that sets any
+flag bit it does not know rather than reading it as a plain put. Entries within
+a block are in ascending key order, and keys across the whole table are
+strictly increasing, so the blocks partition the key space in order.
+
+Blocks are cut around entries, never through them. The current block closes
+once its entry bytes reach `TargetBlockSize`, four kilobytes, so a block
+overshoots the target by at most the last entry added, and an entry that is
+itself that large or larger is given a block to its own. Giving the oversized
+entry its own block is the part worth stating twice: without it, a one-megabyte
+value appended after a handful of small entries would pull them into its block,
+and a reader wanting one of those small entries would have to fetch the whole
+megabyte to reach it.
+
+The index block holds one record per data block,
+
+    [keyLen uvarint][firstKey][offset uint64][length uint32]
+
+where length covers the block's entries and its CRC, followed by a four-byte
+CRC of the index bytes. One key per four kilobytes of table is what makes the
+index small enough to keep in memory. The bloom block is the marshalled filter
+followed by its own four-byte CRC.
+
+The footer is a fixed 56 bytes at the very end of the file:
+
+    [ 0:8 ]  indexOffset uint64
+    [ 8:16]  indexLen    uint64
+    [16:24]  bloomOffset uint64
+    [24:32]  bloomLen    uint64
+    [32:40]  entryCount  uint64
+    [40:48]  magic       uint64, 0x73747261746131, "strata1" in ASCII
+    [48:52]  version     uint32, currently 1
+    [52:56]  crc32c      uint32, over bytes 0 to 52
+
+Being fixed width and last, the footer is the one thing a reader can find
+without knowing anything else, which is why everything needed to navigate the
+file lives in it. Because the magic is stored little endian its bytes appear
+reversed in a hex dump. The four bytes that would otherwise be padding carry a
+version instead, so a reader that meets a layout it does not know says so
+rather than guessing.
+
+Every block carries its own CRC rather than the file carrying one. A single
+whole-file checksum would answer a question nobody asks, since verifying it
+would mean reading the entire table on the way to every lookup, which is
+exactly what the index and the filter exist to avoid. Per-block checksums are
+checked on the one block a lookup actually reads, so the cost is proportional
+to the work being done, and damage is localised: a flipped bit makes its own
+block unreadable and leaves every other block, and the whole of the rest of the
+table, usable.
+
+Everything a reader takes from the file is treated as hostile until it has been
+checked against something else. The footer's checksum is verified before any of
+its fields are believed, then the magic and version, and only then the offsets.
+The offsets have to tile the file exactly, data then index then bloom then
+footer with no gap and no overlap, which is a far tighter condition than merely
+pointing inside the file and leaves no length that could be used to allocate or
+read somewhere it should not. The index is held to the same standard: its
+blocks must start at offset zero, run consecutively, end exactly where the data
+section does, and have strictly increasing first keys, which is also the
+property the binary search in a lookup depends on. Nothing is allocated from a
+length that has not first been bounded by the size of the file.
+
+The index and the filter are both read into memory at open and never written
+again. Both are consulted on the way to every lookup, so leaving them on disk
+would add two reads per lookup to save space the table has already paid for:
+together they come to a few megabytes for a gigabyte of table. Being read-only
+after open is also what makes a reader safe to share, since concurrent lookups
+need no lock beyond what the operating system already gives a positional read.
+
+A point lookup therefore has three places it can stop, cheapest first. The
+Bloom filter turns away a key that was never written, with no disk read at all,
+and that is the common case for a table that does not hold the key. If the
+filter says the key may be present, the index settles which single block could
+contain it, or that none could because the key sorts below the first block, and
+that decision is made in memory too. Only then is one block read, its checksum
+verified, and its entries scanned, and that scan stops as soon as it reaches a
+key above the one sought. So a miss usually costs no I/O, a hit costs one read,
+and nothing costs two.
+
+Writing a table is made crash-safe by never letting an incomplete one be
+visible under its final name. The writer builds the file as a sibling with a
+".tmp" suffix, fsyncs it, closes it, renames it into place, and then fsyncs the
+containing directory. The rename is atomic, so the final name either does not
+exist or refers to a table that is complete down to its footer; there is no
+window in which a reader could open a half-written table, and no need for a
+reader to tolerate one. The directory fsync is the step that is easy to leave
+out and still appear to work: the rename is a change to the directory rather
+than to the file, so until the directory itself is flushed a power loss can
+leave the new name pointing at nothing, even though the file's own contents
+were safely on disk. Fsyncing the file and then the directory is what makes the
+table and the name it is known by durable together. A table with no entries is
+a valid table, which matters because a memtable holding only writes that were
+all superseded can legitimately flush to nothing.
+
+Tombstones are written to the table like any other entry, and this is not an
+optimisation that could be dropped. A table is one layer of a tree, and a
+delete has to outlive the layer it was issued in: an older table lower down may
+still hold a value for that key, and the only thing that can shadow it is a
+record in a newer table saying the key is gone. Dropping tombstones on flush
+would make a deleted key reappear as soon as the lookup reached the older
+table. A tombstone can only be discarded by compaction, and only once it has
+been merged past every table that could still hold an older value for its key,
+which is phase 5's problem.
+
+### Bloom filter
+
+The filter is a bit array plus a hash count. It answers "definitely not
+present" or "probably present", so it can rule a key out but never rule one in,
+and a positive answer always has to be confirmed against the block.
+
+Sizing is ten bits per key with seven hash functions, which gives a false
+positive a little under one percent of the time. Seven is not a free choice: for
+a given number of bits per key the optimal count is the bits per key times the
+natural logarithm of two, which for ten bits rounds to seven. Ten bits is the
+usual point of diminishing returns, since going to fifteen cuts the rate by
+roughly a factor of five but costs half again as much memory for a filter that
+has to stay resident. A one percent rate means about one lookup in a hundred for
+an absent key pays for a block read it did not need, which is a good trade
+against the ninety-nine that pay nothing.
+
+Rather than compute seven independent hashes, the filter takes one 64-bit FNV-1a
+hash of the key, splits it into two 32-bit halves, and derives the i'th bit as
+(h1 + i*h2) modulo the bit count, in 64-bit arithmetic so the sum does not wrap
+before the modulo. This is the Kirsch-Mitzenmacher construction: the false
+positive rate is asymptotically the same as with seven real hashes, at the cost
+of one. FNV is used rather than the standard library's maphash because a filter
+is written to disk and read back by a later process, and maphash seeds itself
+per process, which would make a persisted filter answer differently every run.
+The one degenerate case is a key whose low half hashes to zero, which makes all
+seven probes land on the same bit; at one in four billion keys this costs
+nothing worth correcting for.
+
+The marshalled form is the hash count as one byte, the bit count as a
+little-endian uint32, and then the bit array. Parsing rejects anything whose
+parts disagree: an input too short for the header, a hash count outside one to
+sixteen, a zero bit count, or a bit count that does not match the number of
+bytes that follow. Bounding the hash count matters for more than tidiness,
+since it is read from disk and then used as a loop count.
+
+### What these formats do not do
+
+No compression. Blocks are stored as written, so a table is as large as its
+keys and values. Block-level compression is the obvious next gain, and the
+per-block framing is already the right shape for it.
+
+No block cache. Every block read goes to the operating system, and a block
+buffer is allocated per lookup. The page cache does the real caching, so
+repeated reads of a hot block are not as expensive as they look, but a reader
+holds nothing of its own between lookups, and a hit therefore allocates where
+it need not.
+
+No prefix compression in blocks or in the index. Adjacent keys in a sorted
+table usually share a long prefix, and storing each key whole wastes that. The
+index pays for this most, since it holds a full key per block.
+
+No range scan. A reader can look one key up or walk the whole table from the
+start, and nothing in between: there is no Seek to position an iterator at a
+key. The index makes that straightforward to add, by locating the block and
+then scanning forward within it, and the read path in phase 4 is where it
+belongs.
+
+No support for tables that outgrow a uint32 block length, which is a limit on
+one entry rather than on the table, and no checksum over the data section as a
+whole, so a block that is never read is never verified.
 
 ## Compaction
 
