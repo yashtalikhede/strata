@@ -1,5 +1,7 @@
 package memtable
 
+import "sync"
+
 // Status reports the outcome of a lookup. A memtable distinguishes "this key
 // was deleted here" from "this key is unknown here", because a delete must be
 // able to shadow an older value that still lives in an on-disk table.
@@ -38,12 +40,18 @@ type Entry struct {
 //
 // All methods are safe for concurrent use.
 type Memtable struct {
-	// Fields are added when the structure is implemented.
+	// mu guards list and everything reachable from it. Writes take it
+	// exclusively because an insertion rewrites forward pointers in several
+	// existing nodes, and a reader walking those pointers at the same time
+	// could follow a half-spliced chain. Reads are free to run in parallel
+	// with each other.
+	mu   sync.RWMutex
+	list *skiplist
 }
 
 // New returns an empty memtable ready for use.
 func New() *Memtable {
-	panic("not implemented")
+	return &Memtable{list: newSkiplist()}
 }
 
 // Put stores value under key, replacing any previous value or tombstone for
@@ -54,7 +62,9 @@ func New() *Memtable {
 // real record and not a delete: Get then reports Found with a non-nil,
 // zero-length value.
 func (m *Memtable) Put(key, value []byte) {
-	panic("not implemented")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.list.put(key, value)
 }
 
 // Delete records a tombstone for key, replacing any previous value.
@@ -64,7 +74,9 @@ func (m *Memtable) Put(key, value []byte) {
 // delete has to shadow. A tombstone therefore counts towards Len and appears
 // in Entries. The key is copied.
 func (m *Memtable) Delete(key []byte) {
-	panic("not implemented")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.list.delete(key)
 }
 
 // Get looks up key.
@@ -75,12 +87,27 @@ func (m *Memtable) Delete(key []byte) {
 // returned slice is the caller's own, so mutating it does not affect stored
 // data.
 func (m *Memtable) Get(key []byte) (value []byte, status Status) {
-	panic("not implemented")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	n := m.list.get(key)
+	switch {
+	case n == nil:
+		return nil, NotFound
+	case n.tombstone:
+		return nil, Deleted
+	default:
+		// A copy, so that the caller cannot reach into the node and mutate
+		// stored data without holding the lock.
+		return cloneBytes(n.value), Found
+	}
 }
 
 // Len returns the number of distinct keys held, counting tombstones.
 func (m *Memtable) Len() int {
-	panic("not implemented")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.list.length
 }
 
 // ApproxSize returns the summed size in bytes of the records held: for each
@@ -88,7 +115,9 @@ func (m *Memtable) Len() int {
 // deliberately ignores per-entry overhead, and exists so a caller can decide
 // when a memtable is full enough to flush.
 func (m *Memtable) ApproxSize() int {
-	panic("not implemented")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.list.size
 }
 
 // Entries returns a snapshot of every record held, sorted ascending by key and
@@ -99,5 +128,7 @@ func (m *Memtable) ApproxSize() int {
 // data. The snapshot is what a flush writes to an on-disk table, which is why
 // tombstones have to be part of it.
 func (m *Memtable) Entries() []Entry {
-	panic("not implemented")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.list.entries()
 }
