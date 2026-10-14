@@ -498,7 +498,200 @@ has to arrange exclusion itself.
 
 ## Compaction
 
-To be written in phase 5
+### Why it is needed
+
+Phase 4 left the engine correct and unbounded. Tables accumulated one per
+flush, nothing ever merged them, and three costs grew without limit.
+
+Reads got slower in proportion to the number of flushes rather than the amount
+of data. A lookup that finds nothing has to rule the key out in every table,
+and the phase 4 benchmark measured that directly: 44.63 Bloom checks per miss
+across 45 tables. The filters kept those checks off the disk, which is why the
+engine stayed usable at all, but the work still scaled with table count rather
+than data size.
+
+Space grew with every overwrite. A key written fifty times occupied fifty
+entries on disk, forty-nine of them unreachable, because nothing ever removed
+the older copy.
+
+And deleting data only ever made the database bigger. A tombstone cannot be
+discarded while any older table might hold the value it shadows, so under
+phase 4's rules, where no table was ever rewritten, a tombstone was immortal.
+
+Compaction is the one mechanism that addresses all three: merging a run of
+tables into one keeps the newest version of each key, discards the rest, and
+where the run reaches far enough back, discards tombstones too.
+
+### The three correctness rules
+
+Everything about the merge follows from the fact that **the manifest's order,
+oldest to newest, is the only thing that says which version of a key wins**.
+Not the file number, which a compaction's output takes fresh while sitting in
+the middle of the list. Not the file's timestamp. Just the position.
+
+The first rule follows immediately: **a compaction's inputs must be a
+contiguous run of that list, and its output takes the run's place.** If the
+inputs were scattered, the output would have to occupy several positions at
+once, and there would be no position at which it held the right relationship to
+the tables left between them. Contiguity is what makes one output able to stand
+for all its inputs.
+
+The second is what the merge does: **on equal keys the newest source wins and
+the older versions are discarded.** That is the same rule the read path applies
+when it consults tables newest first, which is why compacting cannot change any
+answer: it computes in advance what a read would have concluded anyway.
+
+The third is the one that is easy to get wrong. **A tombstone may be discarded
+only if the run includes the oldest table, list index 0.** A tombstone is not
+data, it is the absence of data made explicit, and its whole function is to
+shadow an older value. Merge tables 1 to 4 and throw away a tombstone found
+there, and table 0 is still sitting underneath with the value that tombstone
+was hiding; the next lookup walks past the merged output, reaches table 0, and
+returns a value the caller deleted. The deleted key comes back from the dead.
+When the run starts at index 0 there is nothing older left to shadow, and only
+then is the tombstone genuinely redundant. This is why `Compact`, which merges
+everything, is the only operation guaranteed to reclaim deleted space, and why
+the automatic policy often cannot.
+
+### The size-tiered policy
+
+Tables are sorted into size classes and a class holding enough of them has
+them merged. The class of a table is
+
+    bucket(size) = 0                               if size < baseSize
+                   floor(log4(size / baseSize)) + 1 otherwise
+
+computed in integer arithmetic, so the classes come out the same on every
+platform and no float rounding can put one table in two classes on two runs.
+The ratio is four because the trigger is four: merging four tables of one class
+yields one table of roughly four times the size, which lands in the next class
+up and so cannot immediately provoke another merge of the same data. A ratio
+and a trigger that disagreed would either leave classes that never fill or
+merge the same bytes repeatedly.
+
+The policy scans classes from smallest to largest and takes the first that
+holds a long enough run. Smallest first is deliberate: merging four small
+tables costs little and removes four tables from every lookup, while merging
+four large ones rewrites far more bytes to remove the same four. Cheap work
+first keeps the read amplification down for the least write amplification.
+
+Within a class it takes the oldest maximal run of tables that are adjacent *in
+the manifest*, because of the contiguity rule above. A table of a different
+class sitting in the middle therefore breaks a run rather than being merged
+through, even though merging through it would be tempting. At most
+`maxCompactionInputs`, ten, tables are taken from the run's oldest end, so that
+one compaction holds the write lock for a bounded time rather than an
+unpredictable one.
+
+The policy is a pure function of the table sizes, the trigger and the base
+size, which is what lets it be tested exhaustively without a database behind
+it.
+
+### The merge
+
+`internal/compaction` does the merge and knows nothing about files. It takes a
+list of sources ordered oldest to newest and a flag saying whether tombstones
+may be dropped, and calls an emit function once per surviving key.
+
+It is a k-way merge over a heap ordered by key ascending and, for equal keys,
+by age with the newest first, so the top of the heap is always the entry that
+wins. Each step takes that entry, hands it to emit, then advances the winner
+and every other source sitting on the same key, since those are exactly the
+versions it shadowed.
+
+Two details are forced by the sources' memory contract, which is that the
+slices an iterator returns expire on its next `Next`. Emit has to run before
+the winning source is advanced, because the bytes it is given belong to that
+source. And the key being settled has to be copied into a buffer the merge
+owns before anything is advanced, because it is still needed to recognise the
+shadowed versions after the advance that invalidates it. Both are the kind of
+mistake that works in testing and corrupts data under a different block
+boundary, so the test sources deliberately overwrite their buffers on every
+call.
+
+### The commit protocol
+
+A compaction changes the manifest exactly once, and that write is the only
+moment at which anything becomes true.
+
+1. Merge the inputs into a new table. Nothing references it, so as far as any
+   future open is concerned it does not exist. If everything was shadowed or
+   dropped, there is no output table at all and the run simply disappears from
+   the list.
+2. Write a manifest with the inputs replaced by the output at the inputs'
+   position. **This atomic rename is the commit point.**
+3. Close the input readers, delete their files, and swap the output into the
+   live list.
+
+Crash analysis, one point at a time:
+
+*Before the output is finished.* Nothing exists but a partial `.sst.tmp`, which
+`sstable.Writer` never renames into place. The next open deletes temporary
+files, and the manifest still names every input. No data moved.
+
+*After the output is written, before the manifest.* The output file exists under
+its final name but no manifest mentions it. The next open deletes tables the
+manifest does not list, so the output is removed and the inputs are still live.
+The compaction simply did not happen. The test for this crash point recovers a
+six-table database, exactly as it was.
+
+*After the manifest, before the inputs are deleted.* The manifest names the
+output and not the inputs, so the output is live and the input files are
+orphans. The next open deletes tables the manifest does not list, which is now
+the inputs. The compaction fully happened. The test for this crash point
+recovers a three-table database: six tables, less four inputs, plus one output.
+
+The asymmetry is the point. Before the rename nothing needs to be undone,
+because nothing is referenced; after it, nothing is allowed to matter, which is
+why deleting an input is best effort and its failure is ignored.
+
+An automatic compaction that fails is recorded rather than returned. The write
+that triggered the flush that triggered the compaction is already durable and
+visible, so failing it would invite a retry that would duplicate it. The
+failure goes to `Stats().CompactionErrors` and `LastCompactionError`, the loop
+stops, and the next flush tries again; the database meanwhile works correctly
+with more tables than it would like. `Compact`, which a caller invoked on
+purpose, reports its errors normally.
+
+### Manifest version 2
+
+Version 2 differs from version 1 in one rule, not in its bytes: table numbers
+no longer have to increase along the list. They only have to be distinct. A
+compaction's output carries a fresh, high number while taking the position of
+its inputs, so a table late in the list can easily have a lower number than one
+before it, and the old rule would have rejected every compacted database. Every
+other validation is unchanged. A version 1 file is rejected as corrupt rather
+than migrated, which costs nothing because no data was ever deployed under it.
+
+### What it measures
+
+Loading 200,000 entries of 16-byte keys and 100-byte values, with compaction
+and without:
+
+| | tables | write amplification | load time |
+|---|---|---|---|
+| compaction on | 4 | 2.74 | 1.97 s |
+| compaction off | 22 | 1.04 | 1.36 s |
+
+And the lookups that result, per operation:
+
+| | miss | Bloom checks per miss | hit | Bloom checks per hit |
+|---|---|---|---|---|
+| compaction on | 240 ns | 4.97 | 2525 ns | 3.54 |
+| compaction off | 1131 ns | 22.82 | 3114 ns | 11.34 |
+
+So compaction costs about 45% more time on the way in and 2.6 times the bytes
+written, and buys a miss that is 4.6 times faster. The Bloom-check column is
+the read amplification itself, and it tracks the table count exactly: that is
+the quantity phase 4 measured at 44.63 across 45 tables and this phase holds
+near 5. Block reads per lookup stay near one either way, because the index was
+already doing its job; what compaction removes is the per-table work that no
+index can avoid.
+
+A separate test writes fifty generations over the same thousand keys with
+compaction off, reaching 5,070,802 bytes across 293 tables, and one `Compact`
+reduces that to 100,943 bytes in one table, a factor of fifty, which is the
+space amplification being reclaimed rather than the read amplification.
 
 ## Crash-safety guarantees
 
@@ -567,7 +760,7 @@ harmless as things stand, because a log that does not exist replays as an empty
 log and an empty database is what the caller started with. It would need
 closing if the log file ever came to carry information merely by existing.
 
-## Known limitations at the end of Phase 4
+## Known limitations at the end of Phase 5
 
 The engine works and does not lose acknowledged data, but it is not finished,
 and the gaps are structural rather than cosmetic.
@@ -581,18 +774,6 @@ goroutine, with a second memtable taking writes while the first is written out,
 is the fix, and it is the main reason the mutex is a single one rather than
 something finer.
 
-There is no compaction, and this is the largest gap. Tables accumulate, one per
-flush, and nothing ever merges or removes them. Three things follow. A Get that
-misses has to consult every table, so read cost grows with the number of
-flushes rather than with the amount of data; the Bloom filters keep that to one
-check per table instead of a disk read, but the checks still add up. An
-overwritten value stays on disk forever, in the older table nobody reads it
-from. And a tombstone can never be discarded, because there is always the
-possibility of an older table holding the value it shadows, so deleting data
-only ever adds to the space used. The randomised test in this phase ends with
-well over a thousand tables for a few hundred live keys, which is the shape of
-the problem rather than a realistic workload, and reopening such a database
-means opening every one of those tables. Phase 5 exists for this.
 
 There are no range scans, iterators or snapshots in the public API. A caller
 can look one key up and nothing else. The sorted tables and the memtable both
@@ -612,6 +793,40 @@ The process lock is unix-only, as described above.
 There is no block cache. Every block a lookup reads is read from the operating
 system and allocated fresh, so a hot block is re-read and re-allocated on every
 Get that touches it. The page cache absorbs the I/O, but not the allocation.
+
+Compaction runs synchronously under the write lock, like a flush and for the
+same reason, so it stalls every writer and every reader for as long as the
+merge takes. A merge of ten tables is far more work than a flush, which makes
+this the more painful of the two stalls. Moving compaction to a background
+goroutine is the fix, and it is a larger change than moving the flush, because
+a background compaction has to coordinate with the flushes and lookups running
+alongside it over a table list that is no longer frozen.
+
+The strategy is size-tiered only, with no leveled organisation and no key-range
+partitioning. Every compaction therefore rewrites whole tables: there is no way
+to merge the part of a table covering one range of keys and leave the rest, so
+the amount of work a compaction does is set by its inputs' total size rather
+than by how much of them actually overlaps. Leveled compaction, where each
+level holds tables with disjoint key ranges, is what bounds that, at the cost
+of more write amplification for small updates.
+
+There is no rate limiting. A compaction proceeds as fast as the disk allows and
+competes with everything else for it. A real engine budgets compaction I/O so
+that a burst of merging does not starve foreground work.
+
+The oldest table is rarely rewritten, so tombstones can live a long time. The
+policy picks runs by size class, and the oldest table is usually the largest,
+which puts it in a class of its own that rarely fills. Only a run reaching list
+index 0 may drop tombstones, so in practice automatic compaction reclaims
+overwritten values readily and deleted ones hardly at all. `Compact` is the
+remedy and it rewrites everything. A policy that tracked, per table, the oldest
+table whose key ranges overlap it could drop tombstones far more often.
+
+Readers do not run during a compaction. They share a read lock that the
+compaction holds exclusively, so a lookup arriving mid-merge waits. Since the
+tables a compaction reads are immutable and the manifest swap is atomic, there
+is no fundamental reason for that wait; it is a consequence of the single
+mutex, and it goes away with background compaction.
 
 ## Benchmarks
 
