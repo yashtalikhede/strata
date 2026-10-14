@@ -4,7 +4,7 @@
 
 An LSM-tree key-value storage engine written in Go from scratch.
 
-**Status:** In development. Nothing in the roadmap below is implemented yet.
+**Status:** In development. Phase 1 (memtable) is implemented and benchmarked; the remaining roadmap items are in progress.
 
 ## Roadmap
 
