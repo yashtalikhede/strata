@@ -8,7 +8,7 @@ An LSM-tree key-value storage engine written in Go from scratch.
 
 ## Roadmap
 
-- [ ] 1. Memtable (skip list) with Put/Get/Delete
+- [x] 1. Memtable (skip list) with Put/Get/Delete
 - [ ] 2. Write-ahead log with crash recovery
 - [ ] 3. SSTable format with index and bloom filter
 - [ ] 4. Flush path and merged read path
