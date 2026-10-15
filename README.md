@@ -4,7 +4,7 @@
 
 An LSM-tree key-value storage engine written in Go from scratch.
 
-**Status:** In development. Phases 1 to 5 (memtable, write-ahead log, SSTable, flush and read path, compaction) are implemented and benchmarked; the remaining roadmap items are in progress.
+**Status:** All six phases are implemented: the engine is complete, with a public Go package, a command-line tool and a benchmark harness.
 
 ## Roadmap
 
@@ -13,4 +13,4 @@ An LSM-tree key-value storage engine written in Go from scratch.
 - [x] 3. SSTable format with index and bloom filter
 - [x] 4. Flush path and merged read path
 - [x] 5. Compaction with tombstone handling
-- [ ] 6. Benchmarks and CLI
+- [x] 6. Benchmarks and CLI
