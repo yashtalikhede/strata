@@ -760,7 +760,7 @@ harmless as things stand, because a log that does not exist replays as an empty
 log and an empty database is what the caller started with. It would need
 closing if the log file ever came to carry information merely by existing.
 
-## Known limitations at the end of Phase 5
+## Known limitations
 
 The engine works and does not lose acknowledged data, but it is not finished,
 and the gaps are structural rather than cosmetic.
@@ -830,4 +830,205 @@ mutex, and it goes away with background compaction.
 
 ## Benchmarks
 
-To be written in phase 6
+### Methodology
+
+The harness lives in `internal/../bench` and is driven by `strata bench`. Every
+random choice comes from one seed, so two runs of the same configuration touch
+the same keys in the same order and their numbers can be compared.
+
+Keys are sixteen digits, zero padded, and the keys a workload writes are the
+even numbers: `Key(i)` is `2*i`. The absent keys the read-miss workload uses
+are the odd numbers between them, `2*i+1`. That is not an aesthetic choice. If
+the absent keys were drawn from beyond the end of the key space, every table's
+index would turn them away by comparing against its first key, the Bloom
+filters would never be consulted, and the workload would measure the index
+rather than the thing it is named after. Interleaving them forces each lookup
+through the filter of every table.
+
+Values are a pool of 1024 pseudo-random byte strings of the configured size,
+generated once per run from the seed and reused round-robin. The engine never
+looks at a value's contents, so reuse makes its job no easier, and generating
+one value per key would cost more memory than the database under test.
+
+The workloads are:
+
+- `fillseq`: insert every key into an empty database in ascending key order.
+- `fillrandom`: the same, in a random permutation.
+- `overwrite`: rewrite every key of a database that already holds them all.
+- `readhit`: look up keys that are present, in random order.
+- `readmiss`: look up keys that are absent.
+- `mixed`: alternate a lookup of a present key with an overwrite.
+- `deleterandom`: delete half the keys.
+
+What is timed is only the operations the workload is named for. A preload is
+not timed: `overwrite` and `deleterandom` fill their database first and start
+the clock afterwards, and `deleterandom` then checks, untimed, that exactly the
+keys it deleted are gone and the rest survived.
+
+The databases are isolated according to what each workload measures. The two
+fills and `deleterandom` each build their own, so that a fill is always
+measured against an empty database and an overwrite always against a full one.
+`readhit`, `readmiss` and `mixed` share one database, built once in
+`fillrandom` order, because building it three times would take far longer than
+the reads themselves and would measure nothing new; they run in that order, so
+the two read workloads see it before `mixed` writes to it.
+
+### Latency
+
+Every operation is timed individually and its duration written into a slot of a
+preallocated per-thread slice, so recording a sample costs no allocation and no
+lock. The slices are concatenated when the threads finish.
+
+Percentiles use the nearest-rank definition on a sorted copy: the reported value
+is always one of the measured samples rather than an interpolation between two.
+The smallest index covering at least p percent of the samples is taken, so p50
+of two samples is the lower one and p100 is the maximum.
+
+### Why some cells read n/a
+
+The per-operation reader counters, `blockreads/op` and `bloomrejects/op`, are
+differences between two snapshots of the engine's counters. Those counters are
+summed over the tables that are live when they are read, and a compaction
+closes the tables it consumed, so their counts leave the total with them. The
+difference between two snapshots then stops measuring the same set of tables,
+and subtracting the earlier from the later can even go negative, which as
+unsigned arithmetic becomes a number near 2^64.
+
+The harness therefore records whether the compaction count moved during the
+timed section. If it did, the figure is reported as `n/a` rather than as a
+number that cannot be stood behind. That is why the three writing workloads
+show `n/a` while the two read workloads show figures: a read workload compacts
+nothing, so its snapshots are comparable. `deleterandom` shows zeroes because
+no compaction happened to finish inside its timed section, and it issues no
+lookups there in any case.
+
+### Results
+
+Both runs below are from `bench/results/`, taken on one machine in a single
+run, so they show the shape of the engine's behaviour rather than a
+reproducible score. The machine, as the result file reports it: Apple M1, 8
+cores, darwin/arm64, go1.27.2.
+
+The main run is 500,000 entries of 100-byte values, one thread, the log
+unsynced, compaction on, a 4 MiB memtable, seed 1:
+
+| workload | ops | ops/s | MB/s | p50 | p99 | p99.9 | write-amp | tables | blockreads/op | bloomrejects/op |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fillseq | 500000 | 176620 | 19.5 | 2.709µs | 13.75µs | 24.541µs | 1.89 | 4 | n/a | n/a |
+| fillrandom | 500000 | 163603 | 18.1 | 3.083µs | 15.292µs | 28.75µs | 1.89 | 4 | n/a | n/a |
+| overwrite | 500000 | 109448 | 12.1 | 3.125µs | 17.917µs | 52.125µs | 2.68 | 3 | n/a | n/a |
+| readhit | 500000 | 291708 | 32.3 | 3.209µs | 7.542µs | 28.833µs | 1.89 | 4 | 0.954 | 1.721 |
+| readmiss | 500000 | 1115468 | 17.0 | 750ns | 3.375µs | 5.291µs | 1.89 | 4 | 0.033 | 3.967 |
+| mixed | 500000 | 143275 | 15.8 | 3.291µs | 13.333µs | 42.125µs | 2.81 | 2 | n/a | n/a |
+| deleterandom | 250000 | 253702 | 3.9 | 3.208µs | 9.25µs | 19.458µs | 1.84 | 5 | 0.000 | 0.000 |
+
+### What durability costs
+
+The second run prices `SyncAlways`. It uses 3,000 entries rather than 500,000,
+because at roughly 250 operations a second the larger run would take over half
+an hour:
+
+| workload | ops | ops/s | MB/s | p50 | p99 | p99.9 | write-amp | tables | blockreads/op | bloomrejects/op |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fillrandom | 3000 | 263 | 0.0 | 3.968709ms | 5.92725ms | 11.139584ms | 0.00 | 0 | 0.000 | 0.000 |
+| overwrite | 3000 | 227 | 0.0 | 4.098167ms | 8.950417ms | 11.130833ms | 0.00 | 0 | 0.000 | 0.000 |
+
+Dividing the one by the other:
+
+    fillrandom throughput: 163603 / 263 = 622.1x slower
+    overwrite  throughput: 109448 / 227 = 482.1x slower
+    fillrandom p50:        3.968709ms / 3.083us = 1287.3x slower
+    overwrite  p50:        4.098167ms / 3.125us = 1311.4x slower
+
+Two caveats make these numbers a characterisation rather than a measurement.
+The runs use different entry counts, as above. And at 3,000 entries of 100
+bytes nothing ever fills the 4 MiB memtable, so the synced run never flushed:
+its `tables` column is 0 and its write amplification is 0. It is therefore
+measuring a log append plus an fsync, while the unsynced run is measuring a log
+append plus its share of flush and compaction work. The synced run does
+strictly less work per operation apart from the fsync and is still some six
+hundred times slower, which is the point: on this machine fsync is
+`F_FULLFSYNC`, a genuine barrier to the device, and it dominates everything
+else the engine does.
+
+### Reading the results
+
+Three numbers in the main table are worth tying back to the design.
+
+A miss is faster than a hit, 750ns against 3.209µs at the median, and the
+`bloomrejects/op` column says why: a missing key costs 3.967 Bloom checks,
+almost one per table, and only 0.033 block reads. The filters answer the
+question without touching the disk in about 97 percent of cases, which is what
+they exist for. A hit cannot be answered that way: its `blockreads/op` of 0.954
+is close to one, because the index names a single block and that block has to
+be read.
+
+The cost of a hit is also where the absence of a block cache shows. Each hit
+reads its block from the operating system and allocates a fresh buffer for it,
+so a hot block is re-read and re-allocated every time. The page cache absorbs
+the I/O, which is why 3.209µs is as low as it is, but nothing in the engine
+remembers a block between lookups.
+
+Write amplification of 1.89 on a fill is the price of size-tiered compaction:
+every byte is written once by the flush and again by each compaction that later
+includes it. Overwriting pushes it to 2.68, because the same keys are written
+repeatedly and compaction has more shadowed versions to merge away. A leveled
+strategy would trade a higher number here for fewer tables to consult on a
+read.
+
+## Testing strategy
+
+The engine is small enough to test thoroughly and the kind of thing where a
+quiet bug costs data, so the tests are the larger half of the work. They fall
+into six kinds.
+
+**Unit tests** cover each package's own behaviour against hand-written cases:
+the skip list's ordering and tombstones, the log's record framing, the table
+format's byte layout, the Bloom filter's parameters, the merge's newest-wins
+rule. Several pin formats down deliberately, so that a change to an encoding
+has to be an explicit act rather than something that slips through because a
+round trip still agrees with itself.
+
+**Model-based randomized tests** run tens of thousands of operations against a
+Go map holding what the answer should be, comparing every read. They exist
+because hand-written cases only cover what their author thought of. The
+database's version also closes and reopens the store a few hundred times
+during the run, so recovery is exercised continuously rather than in a test of
+its own, and it runs with compaction both on and off. Two fixed seeds are used,
+so a failure is reproducible.
+
+**Fuzz targets** feed arbitrary bytes to the four parsers that read untrusted
+input: `FuzzReplay` for the log, `FuzzUnmarshal` for the Bloom filter,
+`FuzzOpen` for a whole table, and `FuzzManifestDecode` for the manifest. Each
+asserts that the parser never panics, never hangs, and never reports more valid
+bytes than the input holds. This is where the rule that no length read from
+disk may be trusted before it is checked against the file's size gets its
+exercise.
+
+**Process-kill tests** are the only honest way to test crash safety. A child
+process opens the database, writes in a loop, and prints each sequence number
+after the write returns; the parent reads those acknowledgements, sends
+`SIGKILL`, reopens the database and checks that every acknowledged write is
+there, in order, with no gaps. The database's version does this four times over
+one directory, killing at a different point each round so the crash lands at a
+different place in the flush and compaction cycle, and the child reports its
+own compaction count so the parent can confirm the crashes really did land in a
+process that was compacting.
+
+**Fault injection** covers the crash points a kill cannot reach reliably. Test
+only hooks sit at each step of the flush and the compaction, and a hook that
+returns an error aborts the operation there with no cleanup, which is what
+dying at that instant would look like. Each one is paired with a reopen that
+checks the database is whole and that the directory holds only what the
+manifest accounts for. These are what verify the claim that the manifest rename
+is the single commit point: a crash before it must leave the old state intact,
+and a crash after it must leave the new one.
+
+**The race detector and two platforms.** Every test runs under `-race`, and CI
+runs them on Linux and macOS. The two platforms are not redundant: macOS fsync
+is `F_FULLFSYNC`, both far slower and a stronger barrier than Linux's, which
+changes the timing of everything the crash tests depend on.
+
+Coverage is reported by `make cover`. It is deliberately not a gate, both
+because it cannot share a run with `-race` and because the number says how much
+code was executed rather than how much was checked.
