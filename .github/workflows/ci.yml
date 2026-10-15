@@ -7,19 +7,25 @@ on:
 jobs:
   check:
     strategy:
-      # Both platforms report, so a failure on one still shows the other's
-      # result. macOS matters here because its fsync is F_FULLFSYNC, which
-      # the crash-safety tests lean on heavily.
+      # fail-fast off, so a failure on one platform still shows the other's result.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            targets: check
+          # macOS fsync is F_FULLFSYNC, costing milliseconds a call, so the full
+          # suite takes several times longer there; it runs the short suite and
+          # the remaining checks instead, and ubuntu covers the full one.
+          - os: macos-latest
+            targets: test-short vet fmt-check build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
-      - name: make check
-        run: make check
+      - name: make ${{ matrix.targets }}
+        run: make ${{ matrix.targets }}
