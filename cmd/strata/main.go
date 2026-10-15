@@ -1,22 +1,13 @@
-// Command strata is the command-line entry point for the strata storage engine.
+// Command strata is the command-line interface to the strata storage engine.
+//
+// It opens a database directory, performs one operation and exits, or opens an
+// interactive shell. Run "strata help" for the commands.
 package main
 
 import (
-	"flag"
-	"fmt"
 	"os"
 )
 
-var version = "dev"
-
 func main() {
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Printf("strata %s\n", version)
-		os.Exit(0)
-	}
-
-	fmt.Printf("strata %s\n", version)
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
