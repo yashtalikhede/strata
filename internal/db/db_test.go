@@ -20,6 +20,17 @@ import (
 	"github.com/yashtalikhede/strata/internal/wal"
 )
 
+// logicalOpts returns the options for a test about logical correctness rather
+// than durability.
+//
+// SyncNone keeps the write-ahead log out of fsync, which on macOS is
+// F_FULLFSYNC and costs milliseconds a call. Nothing is given up: Close syncs
+// the log, so everything these tests check still survives a close and reopen.
+// Durability against a process dying mid-write is covered by
+// TestCrashRecoveryProcessKill and the hook-based crash tests, which keep
+// SyncAlways precisely because that is what they are about.
+func logicalOpts() *Options { return &Options{Sync: wal.SyncNone} }
+
 // openDB opens a database in dir with opts, closing it when the test ends.
 func openDB(t *testing.T, dir string, opts *Options) *DB {
 	t.Helper()
@@ -80,7 +91,7 @@ func countSuffix(t *testing.T, dir, suffix string) int {
 }
 
 func TestBasic(t *testing.T) {
-	d := openDB(t, t.TempDir(), nil)
+	d := openDB(t, t.TempDir(), logicalOpts())
 
 	if err := d.Put([]byte("a"), []byte("one")); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -148,7 +159,7 @@ func TestBasic(t *testing.T) {
 
 func TestPersistenceViaWAL(t *testing.T) {
 	dir := t.TempDir()
-	d, err := Open(dir, nil)
+	d, err := Open(dir, logicalOpts())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -170,7 +181,7 @@ func TestPersistenceViaWAL(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	d2 := openDB(t, dir, nil)
+	d2 := openDB(t, dir, logicalOpts())
 	for i := range n {
 		k := []byte(fmt.Sprintf("k%04d", i))
 		if i == 7 {
@@ -350,10 +361,14 @@ func TestModelRandomized(t *testing.T) {
 		for _, seed := range []uint64{3, 11} {
 			t.Run(fmt.Sprintf("%s/seed-%d", strings.ReplaceAll(variant.name, " ", "-"), seed), func(t *testing.T) {
 				t.Parallel()
-				const (
-					ops      = 30_000
-					keyspace = 400
-				)
+				const keyspace = 400
+				// Enough operations to shake out ordering bugs, but the
+				// count is what makes this the slowest test in the repo, so
+				// -short takes a sixth of it.
+				ops := 30_000
+				if testing.Short() {
+					ops = 5_000
+				}
 				rng := rand.New(rand.NewPCG(seed, seed))
 				dir := t.TempDir()
 				opts := variant.opts
@@ -623,7 +638,7 @@ func TestManifestCorruption(t *testing.T) {
 			if err := os.WriteFile(manifestPath, corrupt, 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
-			d2, err := Open(dir, nil)
+			d2, err := Open(dir, logicalOpts())
 			if err == nil {
 				d2.Close()
 				t.Fatalf("Open succeeded with manifest byte %d flipped", i)
@@ -636,7 +651,7 @@ func TestManifestCorruption(t *testing.T) {
 		if err := os.WriteFile(manifestPath, good, 0o644); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
-		d2, err := Open(dir, nil)
+		d2, err := Open(dir, logicalOpts())
 		if err != nil {
 			t.Fatalf("Open(restored) = %v, want no error", err)
 		}
@@ -650,7 +665,7 @@ func TestManifestCorruption(t *testing.T) {
 		if n := countSuffix(t, dir, sstSuffix); n == 0 {
 			t.Fatal("test is wrong: no tables left to make this corruption")
 		}
-		d2, err := Open(dir, nil)
+		d2, err := Open(dir, logicalOpts())
 		if err == nil {
 			d2.Close()
 			t.Fatal("Open succeeded with no manifest but tables on disk; it must never silently start empty")
@@ -662,7 +677,7 @@ func TestManifestCorruption(t *testing.T) {
 
 	t.Run("missing manifest in an empty directory is a fresh database", func(t *testing.T) {
 		fresh := t.TempDir()
-		d2 := openDB(t, fresh, nil)
+		d2 := openDB(t, fresh, logicalOpts())
 		if got := d2.Stats().SSTables; got != 0 {
 			t.Errorf("SSTables = %d, want 0", got)
 		}
@@ -707,7 +722,7 @@ func TestMissingSSTableFailsOpen(t *testing.T) {
 		t.Fatalf("Remove: %v", err)
 	}
 
-	d2, err := Open(dir, nil)
+	d2, err := Open(dir, logicalOpts())
 	if err == nil {
 		d2.Close()
 		t.Fatal("Open succeeded with a live table missing")
@@ -721,7 +736,7 @@ func TestMissingSSTableFailsOpen(t *testing.T) {
 	if err := os.WriteFile(victim, saved, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	d3, err := Open(dir, nil)
+	d3, err := Open(dir, logicalOpts())
 	if err != nil {
 		t.Fatalf("Open after restoring the table = %v; the failed Open left the directory locked", err)
 	}
@@ -826,14 +841,14 @@ func TestProcessLock(t *testing.T) {
 		t.Skip("the directory lock is unix-only")
 	}
 	dir := t.TempDir()
-	d, err := Open(dir, nil)
+	d, err := Open(dir, logicalOpts())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 
 	// flock is per descriptor rather than per process, so a second Open in
 	// this same process is blocked exactly as another process would be.
-	d2, err := Open(dir, nil)
+	d2, err := Open(dir, logicalOpts())
 	if !errors.Is(err, ErrLocked) {
 		if err == nil {
 			d2.Close()
@@ -844,7 +859,7 @@ func TestProcessLock(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	d3, err := Open(dir, nil)
+	d3, err := Open(dir, logicalOpts())
 	if err != nil {
 		t.Fatalf("Open after Close = %v, want no error", err)
 	}
@@ -858,7 +873,7 @@ func TestProcessLock(t *testing.T) {
 
 func TestClosed(t *testing.T) {
 	dir := t.TempDir()
-	d, err := Open(dir, nil)
+	d, err := Open(dir, logicalOpts())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1069,8 +1084,12 @@ func TestCrashRecoveryProcessKill(t *testing.T) {
 
 	// Four rounds on the same directory, each continuing the sequence and
 	// killed at a different point, so the crash lands at a different place in
-	// the flush cycle each time.
+	// the flush cycle each time. Each round is a fresh process writing with
+	// SyncAlways, so -short settles for one.
 	targets := []int{300, 450, 777, 1000}
+	if testing.Short() {
+		targets = targets[:1]
+	}
 	opts := &Options{
 		MemtableSize:       4 << 10,
 		CompactionBaseSize: 32 << 10,
@@ -1143,8 +1162,11 @@ func TestCrashRecoveryProcessKill(t *testing.T) {
 
 	// The point of wiring compaction into this test is that the crashes land
 	// in a process that is compacting, so a run where none happened would
-	// prove much less.
-	if childCompactions == 0 {
+	// prove much less. The first round starts from an empty database and
+	// reaches its kill point before enough tables pile up to merge, so this
+	// only holds once later rounds have run; -short keeps the correctness
+	// checks above and gives up this one.
+	if childCompactions == 0 && !testing.Short() {
 		t.Error("no round's child reported a completed compaction; the crashes did not exercise compaction")
 	}
 }
